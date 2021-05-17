@@ -1,4 +1,4 @@
-module github.com/JustTalDevelops/gt-forms
+module github.com/justtaldevelops/gopherforms
 
 go 1.16
 
