@@ -1,29 +1,43 @@
 package gopherforms
 
 import (
+	"bytes"
 	"encoding/json"
 	"github.com/df-mc/dragonfly/dragonfly/player/form"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"go.uber.org/atomic"
 	"strings"
+	"sync"
 )
 
 // User is a user that is connected over Gophertunnel.
 // It is used to contain important session data, like the end-server form ID and the user form ID.
 type User struct {
-	conn *minecraft.Conn
-	localFormId *atomic.Uint32
+	mu           *sync.Mutex
+	forms        map[uint32]form.Form
+	conn         *minecraft.Conn
+	localFormId  *atomic.Uint32
 	remoteFormId *atomic.Uint32
 }
+
+// nullBytes contains the word 'null' converted to a byte slice.
+var nullBytes = []byte("null\n")
 
 // NewUser returns a new user.
 func NewUser(conn *minecraft.Conn) *User {
 	return &User{
+		mu:           &sync.Mutex{},
+		forms:        make(map[uint32]form.Form),
 		conn:         conn,
 		localFormId:  atomic.NewUint32(0),
 		remoteFormId: atomic.NewUint32(0),
 	}
+}
+
+// Conn returns the user connection.
+func (u *User) Conn() *minecraft.Conn {
+	return u.conn
 }
 
 // Remote returns the remote form ID.
@@ -36,8 +50,32 @@ func (u *User) Local() uint32 {
 	return u.localFormId.Load()
 }
 
+// HandleForm handles a form and checks if it was gophertunnel side.
+// If gophertunnel handled the form, it returns true.
+func (u *User) HandleForm(pk *packet.ModalFormResponse) bool {
+	u.mu.Lock()
+	if f, ok := u.forms[pk.FormID]; ok {
+		delete(u.forms, pk.FormID)
+		u.mu.Unlock()
+
+		if bytes.Equal(pk.ResponseData, nullBytes) || len(pk.ResponseData) == 0 {
+			return true
+		}
+		if !ok {
+			return false
+		}
+		if err := f.SubmitJSON(pk.ResponseData, u); err != nil {
+			return false
+		}
+
+		return true
+	}
+
+	return false
+}
+
 // SendForm sends a Dragonfly form to a gophertunnel user.
-func (u *User) SendForm(f form.Form) error {
+func (u *User) SendForm(f form.Form) {
 	var n []map[string]interface{}
 	m := map[string]interface{}{}
 
@@ -70,18 +108,23 @@ func (u *User) SendForm(f form.Form) error {
 
 	b, _ := json.Marshal(m)
 
+	u.mu.Lock()
+	if len(u.forms) > 10 {
+		for k := range u.forms {
+			delete(u.forms, k)
+			break
+		}
+	}
 	u.localFormId.Add(1)
 
-	err := u.conn.WritePacket(&packet.ModalFormRequest{
-		FormID:   u.localFormId.Load(),
+	id := u.localFormId.Load()
+	u.forms[id] = f
+	u.mu.Unlock()
+
+	u.conn.WritePacket(&packet.ModalFormRequest{
+		FormID:   id,
 		FormData: b,
 	})
-
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 // elemToMap encodes a form element to its representation as a map to be encoded to JSON for the client.
